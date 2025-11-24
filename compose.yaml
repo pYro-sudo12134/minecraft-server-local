@@ -1,0 +1,290 @@
+services:
+    step-ca:
+        image: smallstep/step-ca:latest
+        environment:
+            - DOCKER_STEPCA_INIT_NAME=Local Minecraft CA
+            - DOCKER_STEPCA_INIT_DNS_NAMES=step-ca.local,localhost,127.0.0.1,step-ca
+            - DOCKER_STEPCA_INIT_PROVISIONER=${CA_PROVISIONER}
+            - DOCKER_STEPCA_INIT_PASSWORD=${CA_PASSWORD}
+            - STEPCA_ADDRESS=:9000
+        volumes:
+            - step-ca-data:/home/step
+            - ./certs:/export:rw
+        networks:
+            - traefik-net
+        restart: unless-stopped
+        healthcheck:
+            test: ["CMD", "curl", "-k", "-f", "https://localhost:9000/health"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.step-ca.rule=Host(`step-ca.local`)"
+            - "traefik.http.routers.step-ca.entrypoints=websecure"
+            - "traefik.http.routers.step-ca.tls=true"
+            - "traefik.http.routers.step-ca.middlewares=auth"
+            - "traefik.http.services.step-ca.loadbalancer.server.port=9000"
+
+    step-certificates:
+        image: smallstep/step-cli:latest
+        depends_on:
+            step-ca:
+                condition: service_healthy
+        volumes:
+            - step-ca-data:/home/step
+            - ./certs:/export:rw
+        environment:
+            - STEPDEBUG=1
+            - NO_TTY=1
+        networks:
+            - traefik-net
+        command: |
+            sh -c "
+            echo 'Waiting for Step CA to be ready...'
+            until curl -k -f https://step-ca:9000/health > /dev/null 2>&1; do sleep 5; done
+            echo 'Step CA is ready, waiting for initialization...'
+            sleep 15
+            rm -rf /home/step/.step/config
+            FINGERPRINT=$$(step certificate fingerprint /home/step/certs/root_ca.crt)
+            echo \"Root CA Fingerprint: $$FINGERPRINT\"
+            step ca bootstrap --ca-url https://step-ca:9000 --fingerprint $$FINGERPRINT --force
+            step ca certificate --provisioner admin --san traefik.local --password-file <(echo 'changeme123') traefik.local /export/traefik.crt /export/traefik.key --not-after 24h --force
+            step ca certificate --provisioner admin --san jmx-exporter.local --password-file <(echo 'changeme123') jmx-exporter.local /export/jmx-exporter.crt /export/jmx-exporter.key --not-after 24h --force
+            step ca certificate --provisioner admin --san jaeger.local --password-file <(echo 'changeme123') jaeger.local /export/jaeger.crt /export/jaeger.key --not-after 24h --force
+            step ca certificate --provisioner admin --san prometheus.local --password-file <(echo 'changeme123') prometheus.local /export/prometheus.crt /export/prometheus.key --not-after 24h --force
+            step ca certificate --provisioner admin --san grafana.local --password-file <(echo 'changeme123') grafana.local /export/grafana.crt /export/grafana.key --not-after 24h --force
+            step ca certificate --provisioner admin --san dnsmasq.local --password-file <(echo 'changeme123') dnsmasq.local /export/dnsmasq.crt /export/dnsmasq.key --not-after 24h --force
+            step ca certificate --provisioner admin --san step-ca.local --password-file <(echo 'changeme123') step-ca.local /export/step-ca.crt /export/step-ca.key --not-after 24h --force
+            cp /home/step/certs/root_ca.crt /export/root-ca.crt
+            chmod 644 /export/*.crt /export/*.key
+            echo 'All certificates generated successfully!'
+            ls -la /export/
+            "
+        restart: on-failure
+
+    traefik:
+        image: traefik:v2.10
+        command:
+            - "--api.dashboard=true"
+            - "--api.insecure=true"
+            - "--providers.docker=true"
+            - "--providers.docker.exposedbydefault=false"
+            - "--providers.file.filename=/traefik-certs.yaml"
+            - "--entrypoints.web.address=:80"
+            - "--entrypoints.websecure.address=:443"
+            - "--entrypoints.jaeger-agent.address=:6831/udp"
+            - "--accesslog=true"
+            - "--accesslog.format=json"
+            - "--accesslog.fields.headers.defaultmode=keep"
+            - "--metrics.prometheus=true"
+            - "--metrics.prometheus.entrypoint=web"
+            - "--metrics.prometheus.buckets=0.1,0.3,1.2,5.0"
+            - "--tracing=true"
+            - "--tracing.jaeger=true"
+            - "--tracing.jaeger.samplingServerURL=http://jaeger:5778/sampling"
+            - "--tracing.jaeger.localAgentHostPort=jaeger:6831"
+            - "--tracing.jaeger.collector.endpoint=http://jaeger:14268/api/traces?format=jaeger.thrift"
+            - "--tracing.jaeger.propagation=jaeger"
+            - "--tracing.jaeger.traceContextHeaderName=uber-trace-id"
+            - "--metrics.prometheus.addEntryPointsLabels=true"
+            - "--metrics.prometheus.addRoutersLabels=true"
+            - "--metrics.prometheus.addServicesLabels=true"
+            - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+            - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+        ports:
+            - "80:80"
+            - "443:443"
+            - "6831:6831/udp"
+        volumes:
+            - "/var/run/docker.sock:/var/run/docker.sock:ro"
+            - ".htpasswd:/etc/traefik/.htpasswd:ro"
+            - "./certs:/certs:ro"
+            - "./traefik-certs.yaml:/traefik-certs.yaml:ro"
+        networks:
+            - traefik-net
+        restart: unless-stopped
+        depends_on:
+            step-certificates:
+                condition: service_started
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.dashboard.rule=Host(`traefik.local`)"
+            - "traefik.http.routers.dashboard.service=api@internal"
+            - "traefik.http.routers.dashboard.entrypoints=websecure"
+            - "traefik.http.routers.dashboard.tls=true"
+            - "traefik.http.routers.dashboard.middlewares=auth"
+            - "traefik.http.middlewares.auth.basicauth.usersfile=/etc/traefik/.htpasswd"
+
+    minecraft:
+        build: .
+        ports:
+            - "25565:25565"
+        volumes:
+            - minecraft_data:/minecraft/world
+            - minecraft_data:/minecraft/logs
+            - ./server.properties:/minecraft/server.properties
+            - ./ops.json:/minecraft/ops.json
+        tty: true
+        stdin_open: true
+        restart: unless-stopped
+        networks:
+            - traefik-net
+        depends_on:
+            traefik:
+                condition: service_started
+
+    jmx-exporter:
+        image: bitnami/jmx-exporter:latest
+        command: 
+            - '9999'
+            - '/config.yaml'
+        volumes:
+            - ./jmx-config.yaml:/config.yaml:ro
+        environment:
+            - JMX_HOST=minecraft
+            - JMX_PORT=9010
+        networks:
+            - traefik-net
+        depends_on:
+            - minecraft
+            - traefik
+        restart: unless-stopped
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.jmx-exporter.rule=Host(`jmx-exporter.local`)"
+            - "traefik.http.routers.jmx-exporter.entrypoints=websecure"
+            - "traefik.http.routers.jmx-exporter.tls=true"
+            - "traefik.http.routers.jmx-exporter.middlewares=auth"
+            - "traefik.http.services.jmx-exporter.loadbalancer.server.port=9999"
+
+    jaeger:
+        image: jaegertracing/all-in-one:1.48
+        networks:
+            - traefik-net
+        depends_on:
+            - traefik
+        restart: unless-stopped
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.jaeger.rule=Host(`jaeger.local`)"
+            - "traefik.http.routers.jaeger.entrypoints=websecure"
+            - "traefik.http.routers.jaeger.tls=true"
+            - "traefik.http.routers.jaeger.middlewares=auth"
+            - "traefik.http.services.jaeger.loadbalancer.server.port=16686"
+    
+    prometheus:
+        image: prom/prometheus:latest
+        command:
+            - '--config.file=/etc/prometheus/prometheus.yaml'
+            - '--storage.tsdb.path=/prometheus'
+            - '--web.console.libraries=/etc/prometheus/console_libraries'
+            - '--web.console.templates=/etc/prometheus/consoles'
+            - '--web.enable-lifecycle'
+        volumes:
+            - ./prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+            - prometheus_data:/prometheus
+        networks:
+            - traefik-net
+        depends_on:
+            - traefik
+        restart: unless-stopped
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.prometheus.rule=Host(`prometheus.local`)"
+            - "traefik.http.routers.prometheus.entrypoints=websecure"
+            - "traefik.http.routers.prometheus.tls=true"
+            - "traefik.http.routers.prometheus.middlewares=auth"
+            - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+
+    grafana:
+        image: grafana/grafana:latest
+        environment:
+            - GF_SECURITY_DISABLE_GRAVATAR=true
+            - GF_SECURITY_ALLOW_EMBEDDING=false
+            - GF_SECURITY_COOKIE_SECURE=true
+            - GF_SECURITY_COOKIE_SAMESITE=lax
+            - GF_USERS_ALLOW_SIGN_UP=false
+            - GF_USERS_ALLOW_ORG_CREATE=false
+            - GF_AUTH_BASIC_ENABLED=true
+            - GF_AUTH_ANONYMOUS_ENABLED=false
+            - GF_LOG_MODE=console
+            - GF_LOG_LEVEL=warn
+            - GF_SECURITY_DATA_SOURCE_PROXY_WHITELIST=*
+            - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=
+            - GF_PLUGINS_UPDATE_CHECK_ENABLED=false
+            - GF_PLUGINS_AUTO_UPDATE_CHECK_ENABLED=false
+            - GF_PLUGINS_ENABLE_ALPHA=false
+
+        volumes:
+            - grafana_data:/var/lib/grafana
+        networks:
+            - traefik-net
+        depends_on:
+            - traefik
+        restart: unless-stopped
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.grafana.rule=Host(`grafana.local`)"
+            - "traefik.http.routers.grafana.entrypoints=websecure"
+            - "traefik.http.routers.grafana.tls=true"
+            - "traefik.http.routers.grafana.middlewares=auth"
+            - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    
+    dnsmasq:
+        image: jpillora/dnsmasq
+        networks:
+            - traefik-net
+        ports:
+            - "53:53/udp"
+            - "53:53/tcp"
+        environment:
+            - "HTTP_USER="
+            - "HTTP_PASS="
+        volumes:
+            - ./dnsmasq.conf:/etc/dnsmasq.conf
+            - ./update-dns.sh:/scripts/update-dns.sh:ro
+        depends_on:
+            - traefik
+        restart: unless-stopped
+
+
+    ip-updater:
+        image: alpine
+        volumes:
+            - ./update-dns.sh:/update-dns.sh:ro
+            - ./dnsmasq.conf:/etc/dnsmasq.conf:rw
+            - /var/run/docker.sock:/var/run/docker.sock:ro
+        networks:
+            - traefik-net
+        working_dir: /
+        command: >
+            sh -c "
+            apk add curl bash &&
+            while true; do bash update-dns.sh; sleep 300; done
+            "
+        restart: unless-stopped
+
+    backup:
+        image: alpine
+        volumes:
+            - minecraft_data:/minecraft:ro
+            - ./backups:/backups
+            - /var/run/docker.sock:/var/run/docker.sock:ro
+        command: >
+            sh -c "
+            apk add tar cronie &&
+            echo '0 2 * * * tar -czf /backups/minecraft-$$(date +\\%Y\\%m\\%d-\\%H\\%M).tar.gz -C /minecraft .' > /etc/crontabs/root &&
+            crond -f
+            "
+        restart: unless-stopped
+
+volumes:
+    minecraft_data:
+    grafana_data:
+    prometheus_data:
+    step-ca-data:
+
+networks:
+    traefik-net:
+        driver: bridge

@@ -1,0 +1,22 @@
+tls:
+  certificates:
+    - certFile: /certs/traefik.crt
+      keyFile: /certs/traefik.key
+    - certFile: /certs/jmx-exporter.crt
+      keyFile: /certs/jmx-exporter.key
+    - certFile: /certs/jaeger.crt
+      keyFile: /certs/jaeger.key
+    - certFile: /certs/prometheus.crt
+      keyFile: /certs/prometheus.key
+    - certFile: /certs/grafana.crt
+      keyFile: /certs/grafana.key
+    - certFile: /certs/dnsmasq.crt
+      keyFile: /certs/dnsmasq.key
+    - certFile: /certs/step-ca.crt
+      keyFile: /certs/step-ca.key
+
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/traefik.crt
+        keyFile: /certs/traefik.key
